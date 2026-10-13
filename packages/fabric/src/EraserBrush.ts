@@ -185,6 +185,8 @@ export class EraserBrush extends fabric.PencilBrush {
   private eventEmitter: EventTarget;
   private active = false;
   private _disposer?: VoidFunction;
+  private _isMoving = false;
+  private _renderFrameId?: number;
 
   constructor(canvas: fabric.Canvas) {
     super(canvas);
@@ -240,10 +242,40 @@ export class EraserBrush extends fabric.PencilBrush {
 
   /**
    * @override erase
+   *
+   * Erasing composites the entire canvas, so renders triggered by pointer moves are coalesced into one per animation frame.
+   * Pointer events may fire several times per frame (e.g. a stylus at 240Hz on a 60Hz display),
+   * and every extra render is a full canvas composite that is never displayed.
+   * Other renders (e.g. from `after:render`) run synchronously so the erased area never flickers.
    */
   _render(ctx: CanvasRenderingContext2D = this.canvas.getTopContext()): void {
+    if (this._isMoving) {
+      this._requestRender();
+      return;
+    }
+    this._cancelRender();
     super._render(ctx);
     erase(this.canvas.getContext(), ctx, this.effectContext);
+  }
+
+  private _requestRender() {
+    if (this._renderFrameId !== undefined) {
+      return;
+    }
+    this._renderFrameId = fabric.util.requestAnimFrame(() => {
+      delete this._renderFrameId;
+      // points were added since the request, redraw the whole path
+      this.canvas.clearContext(this.canvas.contextTop);
+      this._render();
+    });
+  }
+
+  private _cancelRender() {
+    if (this._renderFrameId === undefined) {
+      return;
+    }
+    fabric.util.cancelAnimFrame(this._renderFrameId);
+    delete this._renderFrameId;
   }
 
   /**
@@ -288,23 +320,34 @@ export class EraserBrush extends fabric.PencilBrush {
   }
 
   /**
-   * @override run if active
+   * @override run if active, coalesce rendering, see {@link _render}
    */
   onMouseMove(
     pointer: fabric.Point,
     context: fabric.TEvent<fabric.TPointerEvent>
   ): void {
-    this.active &&
-      this.eventEmitter.dispatchEvent(
+    if (
+      !this.active ||
+      !this.eventEmitter.dispatchEvent(
         new CustomEvent('move', { detail: context, cancelable: true })
-      ) &&
+      )
+    ) {
+      return;
+    }
+    this._isMoving = true;
+    try {
       super.onMouseMove(pointer, context);
+    } finally {
+      this._isMoving = false;
+    }
   }
 
   /**
    * @override run if active, dispose of {@link drawEffect} listener
    */
   onMouseUp(context: fabric.TEvent<fabric.TPointerEvent>): boolean {
+    // the path is finalized from all points, drop a pending render of a stale path
+    this._cancelRender();
     this.active && super.onMouseUp(context);
     this.active = false;
     this._disposer?.();
@@ -412,6 +455,7 @@ export class EraserBrush extends fabric.PencilBrush {
   }
 
   dispose() {
+    this._cancelRender();
     const { canvas } = this.effectContext;
     // prompt GC
     canvas.width = canvas.height = 0;
